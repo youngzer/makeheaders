@@ -31,7 +31,6 @@
 ** This program is distributed in the hope that it will be useful,
 ** but without any warranty; without even the implied warranty of
 ** merchantability or fitness for a particular purpose.
-** appropriate header files.
 */
 #include <stdio.h>
 #include <stdlib.h>
@@ -52,8 +51,9 @@
 /*
 ** Macros for debugging.
 */
+#undef DEBUG
 #ifdef DEBUG
-static int debugMask = 0;
+static int debugMask = 0xFF;
 # define debug0(F,M)       if( (F)&debugMask ){ fprintf(stderr,M); }
 # define debug1(F,M,A)     if( (F)&debugMask ){ fprintf(stderr,M,A); }
 # define debug2(F,M,A,B)   if( (F)&debugMask ){ fprintf(stderr,M,A,B); }
@@ -189,6 +189,7 @@ struct Decl {
 ** Convenience macros for dealing with declaration properties
 */
 #define DeclHasProperty(D,P)    (((D)->flags&(P))==(P))
+
 #define DeclHasAnyProperty(D,P) (((D)->flags&(P))!=0)
 #define DeclSetProperty(D,P)    (D)->flags |= (P)
 #define DeclClearProperty(D,P)  (D)->flags &= ~(P)
@@ -302,7 +303,7 @@ struct InFile {
 typedef struct String String;
 struct String {
   int nAlloc;      /* Number of bytes allocated */
-  int nUsed;       /* Number of bytes used (not counting null terminator) */
+  int nUsed;       /* Number of bytes used (not counting nul terminator) */
   char *zText;     /* Text of the string */
 };
 
@@ -1019,7 +1020,10 @@ static int GetNonspaceToken(InStream *pIn, Token *pToken){
        pToken->eType!=TT_Space ? pToken->zText : "<space>"); */
     pToken->pComment = blockComment;
     switch( pToken->eType ){
-      case TT_Comment:
+      case TT_Comment:          /*0123456789 12345678 */
+       if( strncmp(pToken->zText, "/*MAKEHEADERS-STOP", 18)==0 ) return nErr;
+       break;
+
       case TT_Space:
         break;
 
@@ -1108,7 +1112,7 @@ static void FindIdentifiersInMacro(Token *pToken, IdentTable *pTable){
 ** unterminated token.
 */
 static int GetBigToken(InStream *pIn, Token *pToken, IdentTable *pTable){
-  const char *z, *zStart;
+  const char *zStart;
   int iStart;
   int nBrace;
   int c;
@@ -1137,7 +1141,6 @@ static int GetBigToken(InStream *pIn, Token *pToken, IdentTable *pTable){
       return nErr;
   }
 
-  z = pIn->z;
   iStart = pIn->i;
   zStart = pToken->zText;
   nLine = pToken->nLine;
@@ -1406,6 +1409,7 @@ static char *TokensToString(
         }
         if( skipOne ){
           pFirst = pFirst->pNext;
+          skipOne = 0;
           continue;
         }
         /* Fall thru to the next case */
@@ -1472,6 +1476,7 @@ static int ProcessTypeDecl(Token *pList, int flags, int *pReset){
   for(pEnd=pName->pNext; pEnd && pEnd->eType!=TT_Braces; pEnd=pEnd->pNext){
     switch( pEnd->zText[0] ){
       case '(':
+      case ')':
       case '*':
       case '[':
       case '=':
@@ -1683,14 +1688,12 @@ static Token *FindDeclName(Token *pFirst, Token *pLast){
 ** added to their class definitions.
 */
 static int ProcessMethodDef(Token *pFirst, Token *pLast, int flags){
-  Token *pCode;
   Token *pClass;
   char *zDecl;
   Decl *pDecl;
   String str;
   int type;
 
-  pCode = pLast;
   pLast = pLast->pPrev;
   while( pFirst->zText[0]=='P' ){
     int rc = 1;
@@ -1735,6 +1738,16 @@ static int ProcessMethodDef(Token *pFirst, Token *pLast, int flags){
   }
   StringAppend(&str, "  ", 0);
   zDecl = TokensToString(pFirst, pLast, ";\n", pClass, 2);
+  if(strncmp(zDecl, pClass->zText, pClass->nText)==0){
+    /* If member initializer list is found after a constructor,
+    ** skip that part. */
+    char * colon = strchr(zDecl, ':');
+    if(colon!=0 && colon[1]!=0){
+      *colon++ = ';';
+      *colon++ = '\n';
+      *colon = 0;
+    }
+  }
   StringAppend(&str, zDecl, 0);
   SafeFree(zDecl);
   pDecl->zExtra = StrDup(StringGet(&str), 0);
@@ -1785,7 +1798,10 @@ static int ProcessProcedureDef(Token *pFirst, Token *pLast, int flags){
       zFilename, pFirst->nLine);
     return 1;
   }
-
+  if( strncmp(pName->zText,"main",pName->nText)==0 ){
+    /* skip main() decl. */
+    return 0;
+  }
   /*
   ** At this point we've isolated a procedure declaration between pFirst
   ** and pLast with the name pName.
@@ -1904,6 +1920,18 @@ static int isVariableDef(Token *pFirst, Token *pEnd){
   return 1;
 }
 
+/*
+** Return TRUE if pFirst is the first token of a static assert.
+*/
+static int isStaticAssert(Token *pFirst){
+  if( (pFirst->nText==13 && strncmp(pFirst->zText, "static_assert", 13)==0)
+   || (pFirst->nText==14 && strncmp(pFirst->zText, "_Static_assert", 14)==0)
+  ){
+    return 1;
+  }else{
+    return 0;
+  }
+}
 
 /*
 ** This routine is called whenever we encounter a ";" or "=".  The stuff
@@ -1962,6 +1990,8 @@ static int ProcessDecl(Token *pFirst, Token *pEnd, int flags){
   }else if( flags & PS_Method ){
     /* Methods are declared by their class.  Don't declare separately. */
     return nErr;
+  }else if( isStaticAssert(pFirst) ){
+    return 0;
   }
   isVar =  (flags & (PS_Typedef|PS_Method))==0 && isVariableDef(pFirst,pEnd);
   if( isVar && (flags & (PS_Interface|PS_Export|PS_Local))!=0
@@ -1972,9 +2002,14 @@ static int ProcessDecl(Token *pFirst, Token *pEnd, int flags){
   }
   pName = FindDeclName(pFirst,pEnd->pPrev);
   if( pName==0 ){
-    fprintf(stderr,"%s:%d: Can't find a name for the object declared here.\n",
-      zFilename, pFirst->nLine);
-    return nErr+1;
+    if( pFirst->nText==4 && strncmp(pFirst->zText,"enum",4)==0 ){
+      /* Ignore completely anonymous enums.  See documentation section 3.8.1. */
+      return nErr;
+    }else{
+      fprintf(stderr,"%s:%d: Can't find a name for the object declared here.\n",
+        zFilename, pFirst->nLine);
+      return nErr+1;
+    }
   }
 
 #ifdef DEBUG
@@ -2176,11 +2211,14 @@ static int ParsePreprocessor(Token *pToken, int flags, int *pPresetFlags){
     }
     if( *zArg==0 || *zArg=='\n' ){ return 0; }
     nArg = pToken->nText + (int)(pToken->zText - zArg);
+    if (pToken->zText[pToken->nText-1] == '\r') { nArg--; }
     if( nArg==9 && strncmp(zArg,"INTERFACE",9)==0 ){
       PushIfMacro(0,0,0,pToken->nLine,PS_Interface);
     }else if( nArg==16 && strncmp(zArg,"EXPORT_INTERFACE",16)==0 ){
       PushIfMacro(0,0,0,pToken->nLine,PS_Export);
     }else if( nArg==15 && strncmp(zArg,"LOCAL_INTERFACE",15)==0 ){
+      PushIfMacro(0,0,0,pToken->nLine,PS_Local);
+    }else if( nArg==15 && strncmp(zArg,"MAKEHEADERS_STOPLOCAL_INTERFACE",15)==0 ){
       PushIfMacro(0,0,0,pToken->nLine,PS_Local);
     }else{
       PushIfMacro(0,zArg,nArg,pToken->nLine,0);
@@ -2195,6 +2233,7 @@ static int ParsePreprocessor(Token *pToken, int flags, int *pPresetFlags){
     }
     if( *zArg==0 || *zArg=='\n' ){ return 0; }
     nArg = pToken->nText + (int)(pToken->zText - zArg);
+    if (pToken->zText[pToken->nText-1] == '\r') { nArg--; }
     PushIfMacro("defined",zArg,nArg,pToken->nLine,0);
   }else if( nCmd==6 && strncmp(zCmd,"ifndef",6)==0 ){
     /*
@@ -2206,6 +2245,7 @@ static int ParsePreprocessor(Token *pToken, int flags, int *pPresetFlags){
     }
     if( *zArg==0 || *zArg=='\n' ){ return 0; }
     nArg = pToken->nText + (int)(pToken->zText - zArg);
+    if (pToken->zText[pToken->nText-1] == '\r') { nArg--; }
     PushIfMacro("!defined",zArg,nArg,pToken->nLine,0);
   }else if( nCmd==4 && strncmp(zCmd,"else",4)==0 ){
     /*
@@ -2772,13 +2812,13 @@ static void CompleteForwardDeclarations(GenState *pState){
   do{
     progress = 0;
     for(pDecl=pDeclFirst; pDecl; pDecl=pDecl->pNext){
-      if( DeclHasProperty(pDecl,DP_Forward)
+      /*if( DeclHasProperty(pDecl,DP_Forward)
        && !DeclHasProperty(pDecl,DP_Declared)
       ){
         DeclareObject(pDecl,pState,1);
         progress = 1;
         assert( DeclHasProperty(pDecl,DP_Declared) );
-      }
+      }*/
     }
   }while( progress );
 }
@@ -2790,7 +2830,7 @@ static void CompleteForwardDeclarations(GenState *pState){
 ** if nolocal_flag is true, then we do not generate declarations for
 ** objected marked DP_Local.
 */
-static int MakeHeader(InFile *pFile, FILE *report, int nolocal_flag){
+static int MakeHeader(InFile *pFile, FILE *report, int nolocal_flag, int h_flag){
   int nErr = 0;
   GenState sState;
   String outStr;
@@ -2799,7 +2839,7 @@ static int MakeHeader(InFile *pFile, FILE *report, int nolocal_flag){
   char *zNewVersion;
   char *zOldVersion;
 
-  if( pFile->zHdr==0 || *pFile->zHdr==0 ) return 0;
+
   sState.pStr = &outStr;
   StringInit(&outStr);
   StringAppend(&outStr,zTopLine,nTopLine);
@@ -2819,6 +2859,15 @@ static int MakeHeader(InFile *pFile, FILE *report, int nolocal_flag){
   CompleteForwardDeclarations(&sState);
   ChangeIfContext(0,&sState);
   nErr += sState.nErr;
+
+  if (h_flag) {
+      printf("%s",StringGet(&outStr));
+      IdentTableReset(&includeTable);
+      StringReset(&outStr);
+      return 0;
+  }
+
+  if( pFile->zHdr==0 || *pFile->zHdr==0 ) return 0;
   zOldVersion = ReadFile(pFile->zHdr);
   zNewVersion = StringGet(&outStr);
   if( report ) fprintf(report,"%s: ",pFile->zHdr);
@@ -3198,6 +3247,7 @@ static void AddParameters(int index, int *pArgc, char ***pArgv){
       }
     }
   }
+  fclose(in);
   newArgc = argc + nNew - 1;
   for(i=0; i<=index; i++){
     zNew[i] = argv[i];
@@ -3370,13 +3420,9 @@ int main(int argc, char **argv){
   }
   ParseFile(pList,PS_Interface);
   FreeTokenList(pList);
-  if( h_flag || H_flag ){
-    nErr += MakeGlobalHeader(H_flag);
-  }else{
-    for(pFile=pFileList; pFile; pFile=pFile->pNext){
-      if( pFile->zSrc==0 ) continue;
-      nErr += MakeHeader(pFile,report,0);
-    }
+  for(pFile=pFileList; pFile; pFile=pFile->pNext){
+    if( pFile->zSrc==0 ) continue;
+    nErr += MakeHeader(pFile,report,0,h_flag);
   }
   return nErr;
 }
