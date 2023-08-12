@@ -3359,9 +3359,11 @@ int main(int argc, char **argv){
       }
     }
   }
+  /*
   if( h_flag && H_flag ){
     h_flag = 0;
   }
+  */
   if( v_flag ){
     report = (h_flag || H_flag) ? stderr : stdout;
   }else{
@@ -3422,7 +3424,13 @@ int main(int argc, char **argv){
   FreeTokenList(pList);
   for(pFile=pFileList; pFile; pFile=pFile->pNext){
     if( pFile->zSrc==0 ) continue;
-    nErr += MakeHeader(pFile,report,0,h_flag);
+    if (H_flag)
+    {
+      nErr += MakeGlobalHeader(1);
+    }
+    else {
+      nErr += MakeHeader(pFile,report,0,h_flag);
+    }
   }
   return nErr;
 }
